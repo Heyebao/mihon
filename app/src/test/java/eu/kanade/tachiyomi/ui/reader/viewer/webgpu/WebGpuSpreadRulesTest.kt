@@ -236,6 +236,7 @@ class WebGpuSpreadRulesTest {
                     WebGpuSpreadRules.canPairShapes(pages[i - 1], pages[i])
 
                 SpreadPosition.SINGLE -> false
+                else -> false
             }
             WebGpuSpreadRules.effectivePosition(position, hasPartner)
         }

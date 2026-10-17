@@ -745,6 +745,7 @@ open class WebGpuViewer(
                 }
 
                 SpreadPosition.SINGLE -> null
+                else -> null
             }
         }
 
