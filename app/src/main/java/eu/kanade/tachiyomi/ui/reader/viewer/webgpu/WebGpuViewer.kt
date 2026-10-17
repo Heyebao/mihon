@@ -156,17 +156,16 @@ open class WebGpuViewer(
     /** Chapters [preloadChapterThenRetry] is already waiting on, by id. */
     private val chapterPreloadsInFlight = HashSet<Long?>()
 
-    /**
-     * Which side of a dual-page spread a [ViewerReaderPage] belongs on - app-level bookkeeping
-     * for [getSpreadAnchor]/[buildSpreadPage], independent of the decoded image itself.
-     */
-    internal enum class SpreadPosition { LEFT, RIGHT, SINGLE }
+    /** The source page whose spread stays visible when page types change. */
+    @Volatile
+    private var layoutTargetPage: ReaderPage? = null
 
-    /** Above this, an untagged page is a spread already, not half of one. */
-    private val wideAspect = 1.2f
+    /** The page last reported to [ReaderActivity.onPageSelected]. */
+    @Volatile
+    private var selectedPage: ReaderPage? = null
 
-    /** How far two untagged pages' aspect ratios may differ and still pair. */
-    private val pairAspectTolerance = 0.1f
+    @Volatile
+    private var layoutUpdateJob: Job? = null
 
     private sealed class PageKey {
         data class Reader(val chapterId: Long?, val index: Int) : PageKey()
@@ -701,34 +700,58 @@ open class WebGpuViewer(
         /** Cached spread ImagePage when this page is the anchor of a dual-page spread */
         var spreadPage: ImagePage.ImageSpread? = null
 
-        /** The side the file names, or null for none. Never a value merely derived from the index. */
-        @Volatile
-        internal var taggedSpreadPosition: SpreadPosition? = null
+        /** The side the file names, or null until read or when it names none. */
+        internal val taggedSpreadPosition: SpreadPosition?
+            get() = WebGpuSpreadRules.taggedPosition(page.spreadTag)
 
-        /** The decoded image's shape, or null while this page is still a placeholder. */
+        /** The source canvas's shape, or null until the decoder header has been read. */
         internal val aspectRatio: Float?
-            get() = (imagePage as? ImagePage.ImageSingle)?.let {
-                val height = it.trimHeight
-                if (it.isDecoded && height > 0) it.trimWidth.toFloat() / height else null
-            }
+            get() = page.sourceSize?.aspectRatio
 
         /**
-         * Which half of a spread this page is on - derived until the file tags it. Without that a
-         * still-loading page stays SINGLE, never pairs, and its ring draws mid-screen; deriving it
-         * live also re-decides it on a rotation in or out of dual mode.
+         * Which half of a spread this page is on - derived until the file tags it. A derived side
+         * without a compatible neighbour is SINGLE, so a lone page fills the viewer rather than
+         * leaving half of it empty.
          *
-         * Untagged goes by [wideAspect] first, then [derivedSpreadPosition].
+         * Untagged goes by [WebGpuSpreadRules.WIDE_ASPECT] first, then [derivedSpreadPosition].
          */
         internal val spreadPosition: SpreadPosition
             get() {
-                taggedSpreadPosition?.let { return it }
-                if (standsAlone) return SpreadPosition.SINGLE
-                return derivedSpreadPosition(page)
+                val raw = rawSpreadPosition()
+                // Page 0 keeps its existing cover placement, unpaired on its own side.
+                if (page.index == 0 && isDualPageMode()) return raw
+                return WebGpuSpreadRules.effectivePosition(raw, partnerFor(raw) != null)
             }
+
+        internal fun rawSpreadPosition(): SpreadPosition {
+            taggedSpreadPosition?.let { return it }
+            if (standsAlone) return SpreadPosition.SINGLE
+            return derivedSpreadPosition(page)
+        }
+
+        internal fun partnerFor(position: SpreadPosition): ViewerReaderPage? {
+            if (!isDualPageMode()) return null
+            return when (position) {
+                anchorPosition -> (next as? ViewerReaderPage)?.takeIf {
+                    it.page.chapter == page.chapter &&
+                        it.rawSpreadPosition() == partnerPosition &&
+                        canPairShapes(this, it)
+                }
+
+                partnerPosition -> (prev as? ViewerReaderPage)?.takeIf {
+                    it.page.chapter == page.chapter &&
+                        it.rawSpreadPosition() == anchorPosition &&
+                        canPairShapes(it, this)
+                }
+
+                SpreadPosition.SINGLE -> null
+                else -> null
+            }
+        }
 
         /** True when nothing may share this page's spread - it is one already. */
         internal val standsAlone: Boolean
-            get() = taggedSpreadPosition == SpreadPosition.SINGLE || (aspectRatio ?: 0f) > wideAspect
+            get() = WebGpuSpreadRules.standsAlone(page.spreadTag, page.sourceSize)
 
         override var imagePage: ImagePage = ProgressPage()
 
@@ -826,8 +849,12 @@ open class WebGpuViewer(
      */
     private fun derivedSpreadPosition(page: ReaderPage): SpreadPosition {
         if (!isDualPageMode()) return SpreadPosition.SINGLE
-        val offset = page.index - spreadStartIndex(page.chapter.chapter.id, page.index)
-        return if (offset >= 0 && offset % 2 == 0) anchorPosition else partnerPosition
+        return WebGpuSpreadRules.positionFor(
+            page.index,
+            spreadStartIndex(page.chapter.chapter.id, page.index),
+            anchorPosition,
+            partnerPosition,
+        )
     }
 
     /**
@@ -836,8 +863,8 @@ open class WebGpuViewer(
      * that page broke. Defaults to 1 - page 0 is the cover, and pairs with nothing.
      */
     private fun spreadStartIndex(chapterId: Long?, index: Int): Int {
-        val lone = synchronized(lock) { loneIndices[chapterId]?.lower(index) } ?: return 1
-        return lone + 1
+        val lone = synchronized(lock) { loneIndices[chapterId]?.lower(index) }
+        return WebGpuSpreadRules.startIndex(lone)
     }
 
     /** Registers whether [page] stands alone, for [spreadStartIndex]. Must hold [lock]. */
@@ -846,17 +873,104 @@ open class WebGpuViewer(
         if (page.standsAlone) indices.add(page.page.index) else indices.remove(page.page.index)
     }
 
+    private fun noteKnownLoneIndices(chapter: ReaderChapter) {
+        val pages = chapter.pages ?: return
+        synchronized(lock) {
+            val indices = loneIndices.getOrPut(chapter.chapter.id) { TreeSet() }
+            pages.forEach { page ->
+                if (page.sourceSize != null || page.spreadTag != ReaderPage.SpreadTag.UNKNOWN) {
+                    if (WebGpuSpreadRules.standsAlone(page.spreadTag, page.sourceSize)) {
+                        indices.add(page.index)
+                    } else {
+                        indices.remove(page.index)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun recordPageType(page: ViewerReaderPage, dec: ImageDecoder) {
+        val tag = if (isDualPageMode()) {
+            when (dec.getTag("PageName")) {
+                "Left" -> ReaderPage.SpreadTag.LEFT
+                "Right" -> ReaderPage.SpreadTag.RIGHT
+                null -> ReaderPage.SpreadTag.NONE
+                else -> ReaderPage.SpreadTag.SINGLE
+            }
+        } else {
+            ReaderPage.SpreadTag.UNKNOWN
+        }
+
+        val changed = synchronized(lock) {
+            if (!pageInCache(page)) return
+            val sizeChanged = page.page.noteSourceSize(dec.width, dec.height)
+            val tagChanged = page.page.noteSpreadTag(tag)
+            if (sizeChanged || tagChanged) noteIfLone(page)
+            sizeChanged || tagChanged
+        }
+
+        if (changed) scheduleLayoutUpdate()
+    }
+
+    private fun scheduleLayoutUpdate() {
+        layoutUpdateJob?.cancel()
+        layoutUpdateJob = scope.launch {
+            if (destroyed || !isDualPageMode()) return@launch
+            while (!destroyed &&
+                (pager.state.pageOffset != 0f || pager.state.animationJob?.isActive == true)
+            ) {
+                delay(16.milliseconds)
+            }
+            if (destroyed || !isDualPageMode()) return@launch
+            applyLayoutUpdate()
+        }
+    }
+
+    private fun applyLayoutUpdate() {
+        val current = currentPage as? ViewerReaderPage ?: return
+        val target = layoutTargetPage?.takeIf { it.chapter == current.page.chapter } ?: current.page
+        val targetViewer = synchronized(lock) {
+            findInCache(PageKey.Reader(target.chapter.chapter.id, target.index))
+        } as? ViewerReaderPage ?: getPage(target)
+        val anchor = getSpreadAnchor(targetViewer)
+        val previous = currentPage
+
+        if (anchor === previous) {
+            noteSelectedPage(progressPage(anchor)?.page)
+            pager.state.invalidate()
+            return
+        }
+
+        pinnedFromPage = previous?.let { buildSpreadPage(it) }
+        synchronized(lock) { flushDeferredCleanup() }
+        currentPage = anchor
+        noteSelectedPage(progressPage(anchor)?.page)
+        preloadPages(anchor)
+        pager.state.invalidate()
+    }
+
+    private fun noteSelectedPage(page: ReaderPage?) {
+        if (page == null || page === selectedPage) return
+        selectedPage = page
+        activity.onPageSelected(page)
+    }
+
+    private fun retargetToCurrentIfStale() {
+        val page = (currentPage as? ViewerReaderPage)?.page
+        if (page == null) {
+            layoutTargetPage = null
+        } else if (layoutTargetPage?.chapter != page.chapter) {
+            layoutTargetPage = page
+        }
+    }
+
     /**
      * Whether these two may share a spread, beyond their positions agreeing. Both tagged is taken
      * as read; a pair resting on page order needs the same shape - halves of one sheet scan alike.
      * Undecoded pairs anyway, or a loading page draws its ring mid-screen.
      */
-    private fun canPairShapes(anchor: ViewerReaderPage, partner: ViewerReaderPage): Boolean {
-        if (anchor.taggedSpreadPosition != null && partner.taggedSpreadPosition != null) return true
-        val a = anchor.aspectRatio ?: return true
-        val b = partner.aspectRatio ?: return true
-        return abs(a - b) <= pairAspectTolerance
-    }
+    private fun canPairShapes(anchor: ViewerReaderPage, partner: ViewerReaderPage): Boolean =
+        WebGpuSpreadRules.canPairShapes(anchor.page, partner.page)
 
     /**
      * Get the anchor page for a spread.
@@ -868,12 +982,7 @@ open class WebGpuViewer(
         if (page !is ViewerReaderPage) return page
 
         if (page.spreadPosition == partnerPosition) {
-            val prev = page.prev as? ViewerReaderPage ?: return page
-            if (prev.page.chapter == page.page.chapter && prev.spreadPosition == anchorPosition &&
-                canPairShapes(prev, page)
-            ) {
-                return prev
-            }
+            return page.partnerFor(partnerPosition) ?: page
         }
 
         return page
@@ -883,14 +992,21 @@ open class WebGpuViewer(
     private fun spreadPartner(page: ViewerReaderPage): ViewerReaderPage? {
         if (!isDualPageMode()) return null
         if (page.spreadPosition != anchorPosition) return null
-        val next = (page.next as? ViewerReaderPage)?.takeIf { it.page.chapter == page.page.chapter } ?: return null
-        return next.takeIf { it.spreadPosition == partnerPosition && canPairShapes(page, it) }
+        return page.partnerFor(anchorPosition)
     }
 
     /** Page to report progress for - the spread's lastmost page, not the anchor. */
     private fun progressPage(page: ViewerPage): ViewerReaderPage? {
         val readerPage = page as? ViewerReaderPage ?: return null
-        return spreadPartner(readerPage) ?: readerPage
+        val partner = spreadPartner(readerPage) ?: return readerPage
+        return partner.takeIf { it.isDecoded } ?: readerPage
+    }
+
+    private fun noteVisibleProgressFromDecode() {
+        scope.launch {
+            if (destroyed || !isDualPageMode()) return@launch
+            currentPage?.let { noteSelectedPage(progressPage(it)?.page) }
+        }
     }
 
     private fun buildSpreadPage(page: ViewerPage): ImagePage {
@@ -1041,6 +1157,7 @@ open class WebGpuViewer(
                     ?: (currentPage as? ViewerTransitionPage)?.let {
                         getPage(it.prevChapter, it.nextChapter)
                     }
+                retargetToCurrentIfStale()
 
                 currentPage?.let { preloadPages(it) }
             }
@@ -1057,6 +1174,8 @@ open class WebGpuViewer(
     override fun destroy() {
         // Before the interrupt: taken mid-decode, only the flag stops the worker parking.
         destroyed = true
+        layoutTargetPage = null
+        selectedPage = null
         scope.cancel()
 
         // shutdownNow interrupts the worker out of lock.wait().
@@ -1358,14 +1477,7 @@ open class WebGpuViewer(
             )
         }
 
-        if (isDualPageMode()) {
-            page.taggedSpreadPosition = when (dec.getTag("PageName")) {
-                "Left" -> SpreadPosition.LEFT
-                "Right" -> SpreadPosition.RIGHT
-                null -> null
-                else -> SpreadPosition.SINGLE
-            }
-        }
+        recordPageType(page, dec)
 
         val backgroundColor = if (config.automaticBackground) null else readerBackgroundColor()
 
@@ -1573,6 +1685,7 @@ open class WebGpuViewer(
                     }
                     noteIfLone(page)
                     pager.state.invalidate()
+                    noteVisibleProgressFromDecode()
                 }
             }
         } finally {
@@ -1630,7 +1743,7 @@ open class WebGpuViewer(
         // Wide page: half of it is wider than the screen aspect ratio or matches a decoded neighbour's shape
         val isWide = listOf(viewerPageFor(page)?.prev, viewerPageFor(page)?.next)
             .mapNotNull { (it as? ViewerReaderPage)?.aspectRatio }
-            .any { abs(aspectRatio / 2f - it) <= pairAspectTolerance } ||
+            .any { abs(aspectRatio / 2f - it) <= WebGpuSpreadRules.PAIR_ASPECT_TOLERANCE } ||
             (aspectRatio > 2f * screenW.toFloat() / screenH)
         if (!isWide) return false
 
@@ -1802,12 +1915,20 @@ open class WebGpuViewer(
         if (pages.isNullOrEmpty()) return
 
         this.viewerChapters = chapters
+        noteKnownLoneIndices(chapters.currChapter)
+        chapters.prevChapter?.let(::noteKnownLoneIndices)
+        chapters.nextChapter?.let(::noteKnownLoneIndices)
 
         // Only when nothing shows yet - re-setting chapters must not move the page.
-        val page = currentPage ?: getPage(pages[min(chapters.currChapter.requestedPage, pages.lastIndex)])
+        val page = currentPage ?: run {
+            val requested = pages[min(chapters.currChapter.requestedPage, pages.lastIndex)]
+            layoutTargetPage = requested
+            getPage(requested)
+        }
         val anchor = getSpreadAnchor(page)
         currentPage = anchor
-        progressPage(anchor)?.let { activity.onPageSelected(it.page) }
+        retargetToCurrentIfStale()
+        noteSelectedPage(progressPage(anchor)?.page)
         preloadPages(anchor)
 
         pager.state.apply {
@@ -1826,6 +1947,7 @@ open class WebGpuViewer(
                 // Synchronous, since the viewer walks getPage() from here - stale, and the next
                 // scroll step crosses the same boundary again.
                 currentPage = page
+                layoutTargetPage = (page as? ViewerReaderPage)?.page
 
                 // The rest ran here too, on the animation thread under the viewer's scroll lock.
                 // Posted in order, so nothing is skipped or reordered - and on this viewer's own
@@ -1836,7 +1958,7 @@ open class WebGpuViewer(
                         if (!activity.isScrollingThroughPages) {
                             activity.hideMenu()
                         }
-                        progressPage(settled)?.let { activity.onPageSelected(it.page) }
+                        noteSelectedPage(progressPage(settled)?.page)
                     }
                     preloadPages(settled)
 
@@ -1861,18 +1983,19 @@ open class WebGpuViewer(
     override fun moveToPage(page: ReaderPage) {
         // Pin first: resolving a target outside the cached window trims the cache.
         pinnedFromPage = currentPage?.let { buildSpreadPage(it) }
-        moveToPage(getSpreadAnchor(getPage(page)))
+        moveToPage(getSpreadAnchor(getPage(page)), page)
     }
 
-    private fun moveToPage(newPage: ViewerPage) {
+    private fun moveToPage(newPage: ViewerPage, layoutTarget: ReaderPage?) {
         val previousPage = currentPage
         // Before preloadPages below trims the cache - see [pinnedFromPage].
         val fromSpread = previousPage?.let { buildSpreadPage(it) }
         pinnedFromPage = fromSpread
         synchronized(lock) { flushDeferredCleanup() }
 
+        layoutTargetPage = layoutTarget
         currentPage = newPage
-        progressPage(newPage)?.let { activity.onPageSelected(it.page) }
+        noteSelectedPage(progressPage(newPage)?.page)
         preloadPages(newPage)
 
         (newPage as? ViewerTransitionPage)?.let { ViewerTransitionPage ->
@@ -1995,7 +2118,7 @@ open class WebGpuViewer(
 
     private fun navigateSpread(direction: Int) {
         val target = currentPage?.let { nextPage(it, direction) } ?: return
-        moveToPage(target)
+        moveToPage(target, (target as? ViewerReaderPage)?.page)
     }
 
     protected fun moveUp() {
