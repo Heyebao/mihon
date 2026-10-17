@@ -60,7 +60,7 @@ class WebGpuViewerContinuous(activity: ReaderActivity, val useGap: Boolean = fal
      */
     private fun select(imagePage: ImagePage) {
         val page = readerPageFor(imagePage) ?: return
-        scope.launch { activity.onPageSelected(page) }
+        scope.launch { noteSelectedPage(page) }
     }
 
     private fun readerPageFor(imagePage: ImagePage): ReaderPage? {
