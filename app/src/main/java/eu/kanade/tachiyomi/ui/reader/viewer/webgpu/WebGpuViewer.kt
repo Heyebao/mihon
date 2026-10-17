@@ -164,9 +164,6 @@ open class WebGpuViewer(
     @Volatile
     private var selectedPage: ReaderPage? = null
 
-    @Volatile
-    private var layoutUpdateJob: Job? = null
-
     private sealed class PageKey {
         data class Reader(val chapterId: Long?, val index: Int) : PageKey()
         data class Transition(val prevId: Long?, val nextId: Long?) : PageKey()
@@ -893,6 +890,10 @@ open class WebGpuViewer(
     }
 
     private fun recordPageType(page: ViewerReaderPage, dec: ImageDecoder) {
+        // Capture while the decoder is open. The source metadata outlives this cache entry.
+        val source = synchronized(lock) { page.page.takeIf { pageInCache(page) } } ?: return
+        val width = dec.width
+        val height = dec.height
         val tag = when (dec.getTag("PageName")) {
             "Left" -> ReaderPage.SpreadTag.LEFT
             "Right" -> ReaderPage.SpreadTag.RIGHT
@@ -900,28 +901,24 @@ open class WebGpuViewer(
             else -> ReaderPage.SpreadTag.SINGLE
         }
 
-        val changed = synchronized(lock) {
-            if (!pageInCache(page)) return
-            val sizeChanged = page.page.noteSourceSize(dec.width, dec.height)
-            val tagChanged = page.page.noteSpreadTag(tag)
-            if (sizeChanged || tagChanged) noteIfLone(page)
-            sizeChanged || tagChanged
-        }
-
-        if (changed) scheduleLayoutUpdate()
-    }
-
-    private fun scheduleLayoutUpdate() {
-        layoutUpdateJob?.cancel()
-        layoutUpdateJob = scope.launch {
-            if (destroyed || !isDualPageMode()) return@launch
-            while (!destroyed &&
+        scope.launch {
+            // Keep fetchPage and onPageChange on the same pairing throughout a dual-page turn.
+            // Continuous and single-page modes need no wait to record their source metadata.
+            while (!destroyed && isDualPageMode() &&
                 (pager.state.pageOffset != 0f || pager.state.animationJob?.isActive == true)
             ) {
                 delay(16.milliseconds)
             }
-            if (destroyed || !isDualPageMode()) return@launch
-            applyLayoutUpdate()
+            if (destroyed) return@launch
+
+            val changed = synchronized(lock) {
+                val sizeChanged = source.noteSourceSize(width, height)
+                val tagChanged = source.noteSpreadTag(tag)
+                if (sizeChanged || tagChanged) noteIfLone(page)
+                sizeChanged || tagChanged
+            }
+            // Commit the topology and its anchor together, without dispatching another job.
+            if (changed && isDualPageMode()) applyLayoutUpdate()
         }
     }
 
@@ -1161,7 +1158,7 @@ open class WebGpuViewer(
                 currentPage?.let { preloadPages(it) }
             }
 
-            if (!isDualPageMode()) {
+            if (!isContinuous && !isDualPageMode()) {
                 noteSelectedPage((currentPage as? ViewerReaderPage)?.page)
             }
             pager.state.invalidate()
