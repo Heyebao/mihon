@@ -1,8 +1,10 @@
 package eu.kanade.tachiyomi.ui.reader.viewer.webgpu
 
+import eu.kanade.tachiyomi.ui.reader.model.ReaderChapter
 import eu.kanade.tachiyomi.ui.reader.model.ReaderPage
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
+import tachiyomi.domain.chapter.model.Chapter
 
 class WebGpuSpreadRulesTest {
 
@@ -62,7 +64,7 @@ class WebGpuSpreadRulesTest {
 
     @Test
     fun `an unknown shape is not the same as a known portrait`() {
-        WebGpuSpreadRules.canPairShapes(page(1), page(2, size(111, 100))) shouldBe true
+        WebGpuSpreadRules.canPairShapes(page(1), page(2, size(111, 100))) shouldBe false
         WebGpuSpreadRules.canPairShapes(
             page(1, size(100, 100)),
             page(2, size(111, 100)),
@@ -197,6 +199,49 @@ class WebGpuSpreadRulesTest {
             SpreadPosition.RIGHT,
             SpreadPosition.LEFT,
         )
+    }
+
+    @Test
+    fun `unknown headers cannot make navigation consume a partner`() {
+        val anchor = page(1, portrait)
+        val partner = page(2)
+        WebGpuSpreadRules.canPairShapes(anchor, partner) shouldBe false
+        WebGpuSpreadRules.canPairShapes(partner, anchor) shouldBe false
+        WebGpuSpreadRules.canPairShapes(page(1), page(2)) shouldBe false
+
+        partner.noteSourceSize(100, 150)
+        WebGpuSpreadRules.canPairShapes(anchor, partner) shouldBe true
+        partner.noteSourceSize(160, 100)
+        WebGpuSpreadRules.canPairShapes(anchor, partner) shouldBe false
+        WebGpuSpreadRules.standsAlone(partner.spreadTag, partner.sourceSize) shouldBe true
+    }
+
+    @Test
+    fun `rebuilding a spread retains its requested second page`() {
+        val chapter = ReaderChapter(Chapter.create().copy(id = 1))
+        val anchor = page(1, portrait).apply { this.chapter = chapter }
+        val requested = page(2, portrait).apply { this.chapter = chapter }
+        WebGpuSpreadRules.layoutTarget(anchor, requested) shouldBe requested
+        WebGpuSpreadRules.layoutTarget(anchor, null) shouldBe anchor
+
+        val otherChapter = ReaderChapter(Chapter.create().copy(id = 2))
+        val stale = page(2, portrait).apply { this.chapter = otherChapter }
+        WebGpuSpreadRules.layoutTarget(anchor, stale) shouldBe anchor
+    }
+
+    @Test
+    fun `a decoded final partner cannot complete a loading or failed anchor`() {
+        val anchor = page(1, portrait)
+        val finalPage = page(2, portrait)
+        val decoded = mutableSetOf(finalPage)
+        WebGpuSpreadRules.progressPage(anchor, finalPage) { it in decoded } shouldBe anchor
+        decoded.clear()
+        WebGpuSpreadRules.progressPage(anchor, finalPage) { it in decoded } shouldBe anchor
+        decoded.add(anchor)
+        WebGpuSpreadRules.progressPage(anchor, finalPage) { it in decoded } shouldBe anchor
+        decoded.add(finalPage)
+        WebGpuSpreadRules.progressPage(anchor, finalPage) { it in decoded } shouldBe finalPage
+        WebGpuSpreadRules.progressPage(anchor, null) { it in decoded } shouldBe anchor
     }
 
     private fun layout(

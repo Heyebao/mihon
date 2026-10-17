@@ -42,14 +42,23 @@ internal object WebGpuSpreadRules {
         return if (offset >= 0 && offset % 2 == 0) anchor else partner
     }
 
+    /** Unknown geometry stays separate until both headers establish a compatible pair. */
     fun canPairShapes(anchor: ReaderPage, partner: ReaderPage): Boolean {
         val anchorTagged = taggedPosition(anchor.spreadTag) != null
         val partnerTagged = taggedPosition(partner.spreadTag) != null
         if (anchorTagged && partnerTagged) return true
-        val a = anchor.sourceSize?.aspectRatio ?: return true
-        val b = partner.sourceSize?.aspectRatio ?: return true
+        val a = anchor.sourceSize?.aspectRatio ?: return false
+        val b = partner.sourceSize?.aspectRatio ?: return false
         return abs(a - b) <= PAIR_ASPECT_TOLERANCE
     }
+
+    /** Preserve the requested source page when settings rebuild its spread. */
+    fun layoutTarget(current: ReaderPage, requested: ReaderPage?): ReaderPage =
+        requested?.takeIf { it.chapter == current.chapter } ?: current
+
+    /** A loading or failed half must not let the other half complete the chapter. */
+    fun <T> progressPage(anchor: T, partner: T?, isDecoded: (T) -> Boolean): T =
+        if (partner != null && isDecoded(anchor) && isDecoded(partner)) partner else anchor
 
     fun effectivePosition(raw: SpreadPosition, hasPartner: Boolean): SpreadPosition =
         if (raw == SpreadPosition.SINGLE || hasPartner) raw else SpreadPosition.SINGLE
